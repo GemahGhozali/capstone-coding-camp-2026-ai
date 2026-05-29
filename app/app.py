@@ -82,9 +82,10 @@ preprocessor = TextPreprocessor(
     min_token_len=2
 )
 
-model          = None
+model           = None
 tokenizer_keras = None
-model_type     = "baseline_jaccard"
+model_type      = "baseline_jaccard"
+model_loaded    = False
 
 
 def clean_text(text):
@@ -94,7 +95,17 @@ def clean_text(text):
     return preprocessor.full_pipeline(text)
 
 
-def load_model():
+def # Lazy loading — model di-load saat request pertama, bukan saat startup
+# Ini mencegah timeout dan out of memory di server dengan RAM terbatas
+def get_model():
+    """Load model hanya saat pertama kali dibutuhkan."""
+    global model, tokenizer_keras, model_type, model_loaded
+    if not model_loaded:
+        load_model()
+        model_loaded = True
+    return model, tokenizer_keras
+
+logger.info("App siap — model akan di-load saat request pertama masuk."):
     """Load model BiLSTM dan tokenizer dari disk."""
     global model, tokenizer_keras, model_type
 
@@ -137,7 +148,17 @@ def load_model():
         model_type = "baseline_jaccard"
 
 
-load_model()
+# Lazy loading — model di-load saat request pertama, bukan saat startup
+# Ini mencegah timeout dan out of memory di server dengan RAM terbatas
+def get_model():
+    """Load model hanya saat pertama kali dibutuhkan."""
+    global model, tokenizer_keras, model_type, model_loaded
+    if not model_loaded:
+        load_model()
+        model_loaded = True
+    return model, tokenizer_keras
+
+logger.info("App siap — model akan di-load saat request pertama masuk.")
 
 
 # ── Scoring Engine ────────────────────────────────────────────────────────────
@@ -304,6 +325,10 @@ Langsung tulis feedbacknya tanpa preamble."""
 
 def grade_answer(student_answer: str, reference_answer: str, max_score: float = 100.0) -> dict:
     """Fungsi inti penilaian."""
+    # Trigger lazy load jika belum di-load
+    if not model_loaded:
+        get_model()
+
     if model_type == "bilstm_glove" and model is not None:
         score_data = score_with_bilstm(student_answer, reference_answer)
     else:
