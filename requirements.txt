@@ -1,9 +1,7 @@
 flask
 flask-cors
 tensorflow==2.15.0
-# keras==2.15.0
-# tensorflow==2.20.0
-keras==3.13.2
+keras==2.15.0
 PySastrawi
 nltk
 langdetect
