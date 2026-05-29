@@ -3,18 +3,13 @@ app.py
 ======
 Flask REST API untuk Essay Grader AI.
 Model: Siamese BiLSTM + GloVe (TensorFlow)
-Menerima jawaban siswa + kunci jawaban, mengembalikan skor & feedback.
-
-Endpoint:
-    POST /grade       — nilai satu jawaban
-    POST /grade/batch — nilai banyak jawaban sekaligus
-    GET  /health      — cek status API
-    GET  /info        — informasi model yang aktif
 
 Dependensi:
     pip install flask flask-cors tensorflow PySastrawi nltk langdetect google-generativeai
 
 Jalankan:
+    set GEMINI_API_KEY=isi_api_key_kamu  (Windows)
+    export GEMINI_API_KEY=isi_api_key_kamu  (Linux/Mac)
     python app/app.py
 """
 
@@ -30,7 +25,7 @@ from functools import wraps
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ── Path setup ───────────────────────────────────────────────────────────────
+# ── Path setup ────────────────────────────────────────────────────────────────
 BASE_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_PATH)
 
@@ -49,18 +44,37 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_PATH      = os.getenv("MODEL_PATH",      os.path.join(BASE_PATH, "model", "essay_grader_bilstm.keras"))
-TOKENIZER_PATH  = os.getenv("TOKENIZER_PATH",  os.path.join(BASE_PATH, "model", "tokenizer.pkl"))
+MODEL_PATH      = os.getenv("MODEL_PATH",     os.path.join(BASE_PATH, "model", "essay_grader_bilstm.keras"))
+TOKENIZER_PATH  = os.getenv("TOKENIZER_PATH", os.path.join(BASE_PATH, "model", "tokenizer.pkl"))
 MAX_TEXT_LENGTH = int(os.getenv("MAX_TEXT_LENGTH", 5000))
-MAX_BATCH_SIZE  = int(os.getenv("MAX_BATCH_SIZE",  50))
-MAX_LEN         = 100  # harus sama dengan saat training
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")  # diisi oleh rekan fullstack
+MAX_BATCH_SIZE  = int(os.getenv("MAX_BATCH_SIZE", 50))
+MAX_LEN         = 100
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 
-# ── Setup Gemini API ──────────────────────────────────────────────────────────
-gemini_model = None
+# ── Global variables ──────────────────────────────────────────────────────────
+model           = None
+tokenizer_keras = None
+model_type      = "baseline_jaccard"
+model_loaded    = False
+gemini_model    = None
 
+# ── Preprocessor ──────────────────────────────────────────────────────────────
+preprocessor = TextPreprocessor(
+    remove_stopwords=True,
+    do_stemming=False,
+    keep_numbers=True,
+    min_token_len=2
+)
+
+
+def clean_text(text):
+    if not isinstance(text, str) or not text.strip():
+        return ''
+    return preprocessor.full_pipeline(text)
+
+
+# ── Setup Gemini ──────────────────────────────────────────────────────────────
 def setup_gemini():
-    """Inisialisasi Gemini API. Dipanggil saat startup."""
     global gemini_model
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY tidak ditemukan. Fitur AI feedback tidak aktif.")
@@ -71,42 +85,15 @@ def setup_gemini():
         gemini_model = genai.GenerativeModel('gemini-1.5-flash')
         logger.info("Gemini API berhasil diinisialisasi.")
     except Exception as e:
-        logger.warning(f"Gagal inisialisasi Gemini API: {e}")
+        logger.warning(f"Gagal inisialisasi Gemini: {e}")
         gemini_model = None
 
-# ── Load model & preprocessor ─────────────────────────────────────────────────
-preprocessor = TextPreprocessor(
-    remove_stopwords=True,
-    do_stemming=False,
-    keep_numbers=True,
-    min_token_len=2
-)
 
-model           = None
-tokenizer_keras = None
-model_type      = "baseline_jaccard"
-model_loaded    = False
+setup_gemini()
 
 
-def clean_text(text):
-    """Preprocessing teks sesuai pipeline BiLSTM."""
-    if not isinstance(text, str) or not text.strip():
-        return ''
-    return preprocessor.full_pipeline(text)
-
-
-def # Lazy loading — model di-load saat request pertama, bukan saat startup
-# Ini mencegah timeout dan out of memory di server dengan RAM terbatas
-def get_model():
-    """Load model hanya saat pertama kali dibutuhkan."""
-    global model, tokenizer_keras, model_type, model_loaded
-    if not model_loaded:
-        load_model()
-        model_loaded = True
-    return model, tokenizer_keras
-
-logger.info("App siap — model akan di-load saat request pertama masuk."):
-    """Load model BiLSTM dan tokenizer dari disk."""
+# ── Load model (lazy) ─────────────────────────────────────────────────────────
+def load_model():
     global model, tokenizer_keras, model_type
 
     model_ok     = os.path.exists(MODEL_PATH)
@@ -116,7 +103,6 @@ logger.info("App siap — model akan di-load saat request pertama masuk."):
         try:
             import tensorflow as tf
 
-            # Custom layer yang dibutuhkan saat load model
             class CosineSimilarityLayer(tf.keras.layers.Layer):
                 def __init__(self, **kwargs):
                     super(CosineSimilarityLayer, self).__init__(**kwargs)
@@ -148,34 +134,35 @@ logger.info("App siap — model akan di-load saat request pertama masuk."):
         model_type = "baseline_jaccard"
 
 
-# Lazy loading — model di-load saat request pertama, bukan saat startup
-# Ini mencegah timeout dan out of memory di server dengan RAM terbatas
 def get_model():
-    """Load model hanya saat pertama kali dibutuhkan."""
-    global model, tokenizer_keras, model_type, model_loaded
+    """Lazy load model — hanya load saat pertama kali dibutuhkan."""
+    global model_loaded
     if not model_loaded:
+        logger.info("Loading model untuk pertama kali...")
         load_model()
         model_loaded = True
     return model, tokenizer_keras
+
 
 logger.info("App siap — model akan di-load saat request pertama masuk.")
 
 
 # ── Scoring Engine ────────────────────────────────────────────────────────────
-
 def texts_to_sequences(texts, max_len=MAX_LEN):
-    """Konversi teks ke sequence integer dengan padding."""
     import tensorflow as tf
-    seqs = tokenizer_keras.texts_to_sequences(list(texts))
+    _, tok = get_model()
+    if tok is None:
+        return None
+    seqs = tok.texts_to_sequences(list(texts))
     return tf.keras.preprocessing.sequence.pad_sequences(
         seqs, maxlen=max_len, padding='post', truncating='post'
     )
 
 
-def score_with_bilstm(student_answer: str, reference_answer: str) -> dict:
-    """Scoring menggunakan model BiLSTM. Menggunakan direct model call untuk mencegah memory leak."""  
-    """Scoring menggunakan model BiLSTM."""
-    import numpy as np
+def score_with_bilstm(student_answer, reference_answer):
+    m, _ = get_model()
+    if m is None:
+        return score_with_jaccard(student_answer, reference_answer)
 
     stu_clean = clean_text(student_answer)
     ref_clean = clean_text(reference_answer)
@@ -184,10 +171,9 @@ def score_with_bilstm(student_answer: str, reference_answer: str) -> dict:
     ref_seq = texts_to_sequences([ref_clean])
 
     inputs  = {'student_input': stu_seq, 'reference_input': ref_seq}
-    proba   = model(inputs, training=False).numpy()[0]
+    proba   = m(inputs, training=False).numpy()[0]
     raw_cls = int(np.argmax(proba))
 
-    # Konversi kelas ke similarity score
     sim_map    = {0: 0.0, 1: 0.5, 2: 1.0}
     similarity = sim_map[raw_cls]
 
@@ -199,12 +185,11 @@ def score_with_bilstm(student_answer: str, reference_answer: str) -> dict:
             'skor_1': round(float(proba[1]), 4),
             'skor_2': round(float(proba[2]), 4),
         },
-        'method'       : 'bilstm_glove',
+        'method': 'bilstm_glove',
     }
 
 
-def score_with_jaccard(student_answer: str, reference_answer: str) -> dict:
-    """Baseline scoring menggunakan Jaccard similarity."""
+def score_with_jaccard(student_answer, reference_answer):
     result     = compare_texts(student_answer, reference_answer, preprocessor)
     similarity = result["jaccard_similarity"]
     return {
@@ -215,8 +200,7 @@ def score_with_jaccard(student_answer: str, reference_answer: str) -> dict:
     }
 
 
-def similarity_to_score(similarity: float, max_score: float) -> float:
-    """Konversi similarity (0.0–1.0) ke skor angka."""
+def similarity_to_score(similarity, max_score):
     sim = max(0.0, min(1.0, similarity))
     if sim < 0.20:
         normalized = (sim / 0.20) * 30
@@ -229,8 +213,7 @@ def similarity_to_score(similarity: float, max_score: float) -> float:
     return round((normalized / 100) * max_score, 1)
 
 
-def score_to_grade(score: float, max_score: float) -> str:
-    """Konversi skor numerik ke grade huruf."""
+def score_to_grade(score, max_score):
     pct = (score / max_score) * 100 if max_score > 0 else 0
     if pct >= 90: return "A"
     if pct >= 80: return "B+"
@@ -241,8 +224,31 @@ def score_to_grade(score: float, max_score: float) -> str:
     return "E"
 
 
-def generate_feedback(similarity: float, reference_answer: str, student_answer: str) -> dict:
-    """Generate feedback otomatis berdasarkan skor similarity."""
+def generate_ai_feedback(student_answer, reference_answer, score, max_score, grade):
+    if gemini_model is None:
+        return ""
+    try:
+        prompt = f"""Kamu adalah asisten guru yang membantu memberikan feedback pada jawaban siswa.
+
+Kunci Jawaban: {reference_answer}
+Jawaban Siswa: {student_answer}
+Skor yang diperoleh: {score}/{max_score} (Grade: {grade})
+
+Berikan feedback singkat (2-3 kalimat) dalam Bahasa Indonesia yang:
+1. Menjelaskan kelebihan jawaban siswa
+2. Menjelaskan apa yang perlu diperbaiki atau ditambahkan
+3. Memberikan semangat kepada siswa
+
+Langsung tulis feedbacknya tanpa preamble."""
+
+        response = gemini_model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        logger.warning(f"Gemini API error: {e}")
+        return ""
+
+
+def generate_feedback(similarity, reference_answer, student_answer):
     ref_tokens = set(preprocessor.full_pipeline(reference_answer, return_tokens=True))
     stu_tokens = set(preprocessor.full_pipeline(student_answer,   return_tokens=True))
 
@@ -293,41 +299,8 @@ def generate_feedback(similarity: float, reference_answer: str, student_answer: 
     }
 
 
-def generate_ai_feedback(student_answer: str, reference_answer: str,
-                         score: float, max_score: float, grade: str) -> str:
-    """
-    Generate feedback natural menggunakan Gemini API.
-    Fitur tambahan (side quest) — aktif jika GEMINI_API_KEY tersedia.
-    Jika Gemini tidak tersedia, return string kosong.
-    """
-    if gemini_model is None:
-        return ""
-    try:
-        prompt = f"""Kamu adalah asisten guru yang membantu memberikan feedback pada jawaban siswa.
-
-Kunci Jawaban: {reference_answer}
-Jawaban Siswa: {student_answer}
-Skor yang diperoleh: {score}/{max_score} (Grade: {grade})
-
-Berikan feedback singkat (2-3 kalimat) dalam Bahasa Indonesia yang:
-1. Menjelaskan kelebihan jawaban siswa
-2. Menjelaskan apa yang perlu diperbaiki atau ditambahkan
-3. Memberikan semangat kepada siswa
-
-Langsung tulis feedbacknya tanpa preamble."""
-
-        response = gemini_model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        logger.warning(f"Gemini API error: {e}")
-        return ""
-
-
-def grade_answer(student_answer: str, reference_answer: str, max_score: float = 100.0) -> dict:
-    """Fungsi inti penilaian."""
-    # Trigger lazy load jika belum di-load
-    if not model_loaded:
-        get_model()
+def grade_answer(student_answer, reference_answer, max_score=100.0):
+    get_model()  # trigger lazy load
 
     if model_type == "bilstm_glove" and model is not None:
         score_data = score_with_bilstm(student_answer, reference_answer)
@@ -339,8 +312,6 @@ def grade_answer(student_answer: str, reference_answer: str, max_score: float = 
     score      = similarity_to_score(similarity, max_score)
     grade      = score_to_grade(score, max_score)
     feedback   = generate_feedback(similarity, reference_answer, student_answer)
-
-    # Generate AI feedback (Gemini) — fitur tambahan
     ai_feedback = generate_ai_feedback(student_answer, reference_answer, score, max_score, grade)
 
     return {
@@ -358,9 +329,8 @@ def grade_answer(student_answer: str, reference_answer: str, max_score: float = 
     }
 
 
-# ── Middleware / Helpers ──────────────────────────────────────────────────────
-
-def validate_text(text, field_name: str):
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def validate_text(text, field_name):
     if not text:
         return f"Field '{field_name}' wajib diisi."
     if not isinstance(text, str):
@@ -372,7 +342,7 @@ def validate_text(text, field_name: str):
     return None
 
 
-def api_response(data: dict, status: int = 200):
+def api_response(data, status=200):
     return jsonify({
         "status"   : "success" if status < 400 else "error",
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -392,13 +362,13 @@ def handle_errors(f):
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-
 @app.route("/health", methods=["GET"])
 def health():
     return api_response({
         "api_status"   : "ok",
         "model_type"   : model_type,
         "model_ready"  : model_type == "bilstm_glove",
+        "model_loaded" : model_loaded,
         "gemini_active": gemini_model is not None,
     })
 
@@ -409,8 +379,8 @@ def info():
         "api_version"  : "2.0.0",
         "model_type"   : model_type,
         "model_ready"  : model_type == "bilstm_glove",
-        "architecture"  : "Siamese BiLSTM + GloVe Embedding",
-        "gemini_active" : gemini_model is not None,
+        "architecture" : "Siamese BiLSTM + GloVe Embedding",
+        "gemini_active": gemini_model is not None,
         "max_text_len" : MAX_TEXT_LENGTH,
         "max_batch"    : MAX_BATCH_SIZE,
         "endpoints"    : {
@@ -498,8 +468,6 @@ def grade_batch():
     })
 
 
-# ── Error Handlers ────────────────────────────────────────────────────────────
-
 @app.errorhandler(404)
 def not_found(e):
     return api_response({"message": "Endpoint tidak ditemukan."}, 404)
@@ -514,9 +482,8 @@ def internal_error(e):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     port  = int(os.getenv("PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    logger.info(f"Essay Grader API starting — port={port}, model={model_type}")
+    logger.info(f"Essay Grader API starting — port={port}")
     app.run(host="0.0.0.0", port=port, debug=debug)
