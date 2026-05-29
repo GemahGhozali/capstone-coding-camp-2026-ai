@@ -152,6 +152,7 @@ def texts_to_sequences(texts, max_len=MAX_LEN):
 
 
 def score_with_bilstm(student_answer: str, reference_answer: str) -> dict:
+    """Scoring menggunakan model BiLSTM. Menggunakan direct model call untuk mencegah memory leak."""  
     """Scoring menggunakan model BiLSTM."""
     import numpy as np
 
@@ -162,7 +163,7 @@ def score_with_bilstm(student_answer: str, reference_answer: str) -> dict:
     ref_seq = texts_to_sequences([ref_clean])
 
     inputs  = {'student_input': stu_seq, 'reference_input': ref_seq}
-    proba   = model.predict(inputs, verbose=0)[0]
+    proba   = model(inputs, training=False).numpy()[0]
     raw_cls = int(np.argmax(proba))
 
     # Konversi kelas ke similarity score
