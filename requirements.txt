@@ -8,5 +8,5 @@ langdetect
 google-generativeai
 numpy
 pandas
-scikit-
+scikit-learn
 gunicorn
